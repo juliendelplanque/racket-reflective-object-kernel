@@ -120,6 +120,10 @@
 (define (compute-extended-instance-variables superclass new-instance-variables)
   (append (get-class-instance-variables superclass) new-instance-variables))
 
+; Macro to make method definition less verbose.
+(define-syntax-rule (add-method class selector arguments method-body)
+  (register-method class selector (lambda arguments method-body)))
+
 ;-------------------------------------------------------------------------------
 
 ;-- Primitive for instance creation --------------------------------------------
@@ -140,10 +144,20 @@
   (make-hash))
 
 (define (register-class namespace class-object)
+  (print "Register: ")
+  (println (get-class-name class-object))
   (dict-set! namespace (get-class-name class-object) class-object))
 
 (define (get-class namespace symbol)
   (dict-ref namespace symbol))
+
+(define (is-bound? namespace symbol)
+  (dict-has-key? namespace symbol))
+
+(define (get-class-or-null namespace symbol)
+  (if (is-bound? namespace symbol)
+    (get-class namespace symbol)
+    null))
 
 ;-------------------------------------------------------------------------------
 
@@ -160,77 +174,171 @@
 
 ;-------------------------------------------------------------------------------
 
-;-- Primitives for sending messages --------------------------------------------
+;-- Helper methods to manipulate objects ---------------------------------------
 
-; Helpers
 (define (get-object-class object namespace)
-  (get-class (get-object-class-name object)))
-
+  (get-class namespace (get-object-class-name object)))
 
 (define (get-object-superclass object namespace)
-  (get-class (get-class-superclass-name (get-object-class object) namespace)))
+  (get-class namespace (get-class-superclass-name (get-object-class object namespace))))
+
+(define (set-instance-variable-value object instance-variable-name value namespace)
+  (object-set!
+    object
+    (index-of (get-class-instance-variables (get-object-class object namespace)) instance-variable-name)
+    value))
+
+(define (get-instance-variable-value object instance-variable-name namespace)
+  (object-ref
+    object
+    (index-of (get-class-instance-variables (get-object-class object namespace)) instance-variable-name)))
+
+;-- Primitives for sending messages --------------------------------------------
 
 (define (lookup selector class namespace)
   (if (has-method class selector)
       (get-method class selector)
       (if (eq? (get-class-name class) 'Object)
           null
-          (lookup selector (get-class namespace (get-class-superclass-name class))))))
+          (lookup selector (get-class namespace (get-class-superclass-name class)) namespace))))
 
 (define (send receiver selector arguments namespace [super? #f])
   (let
     ([lookup-start
-      (if super? (get-object-superclass) (get-object-class receiver))])
+      (if super? (get-object-superclass receiver namespace) (get-object-class receiver namespace))])
     (parameterize
       ([bound-self receiver])
-      (apply (lookup selector lookup-start) arguments))))
+      (apply (lookup selector lookup-start namespace) arguments))))
+
+(define (super-send receiver selector arguments namespace)
+  (send receiver selector arguments namespace true))
 
 ;-------------------------------------------------------------------------------
 
 ;-- Bootstraping the kernel ----------------------------------------------------
 
-; (define (build-Class-initialize Class)
-;   (register-method Class 'initialize
-;     (lambda ()
-;       )))
+(define (build-Class-initialize Class namespace)
+  (add-method Class 'initialize ()
+    (let (
+      [superclass-or-null (get-class-or-null namespace (get-class-superclass-name self))])
+      (begin
+        (if (null? superclass-or-null)
+            (set-class-instance-variables
+               self
+               (append '(class) (get-class-instance-variables self)))
+            (set-class-instance-variables
+               self
+               (compute-extended-instance-variables
+                 superclass-or-null
+                 (get-class-instance-variables self))))
+        (set-class-methods-dictionary self (make-methods-dictionary))
+        self))))
 
 (define (build-Class-new Class namespace)
-  (register-method Class 'new
-    (lambda ()
-      (send (send self 'allocate '() namespace) 'initialize '() namespace))))
+  (add-method Class 'new ()
+    (send (send self 'allocate '() namespace) 'initialize '() namespace)))
 
 (define (build-Class-allocate Class namespace)
-  (register-method Class 'allocate
-    (lambda ()
-      (allocate-new-instance self))))
+  (add-method Class 'allocate ()
+      (allocate-new-instance self)))
 
-(define (build-Class namespace)
-  (let ([Class (make-object 6)])
+(define (manually-build-Class namespace)
+  (let ([Class (make-class)])
     (set-object-class-name Class 'Class)
     (set-class-name Class 'Class)
     (set-class-superclass-name Class 'Object)
-    (set-class-instance-variables Class '(class name superclass iv keywords methodDict))
+    (set-class-instance-variables Class '(class name superclass iv methodDict))
     (set-class-methods-dictionary Class (make-methods-dictionary))
-    (register-class namespace Class)))
+    (register-class namespace Class)
+    (build-Class-initialize (get-class namespace 'Class) namespace)
+    (build-Class-new (get-class namespace 'Class) namespace)
+    (build-Class-allocate (get-class namespace 'Class) namespace)
+    Class))
+
+(define (build-Object namespace)
+  (let ([Object (send (get-class namespace 'Class) 'new '() namespace)])
+    (begin
+      (set-instance-variable-value Object 'name 'Object namespace)
+      (register-class namespace Object) ; Register Object class in namespace ASAP. ;-)
+      (set-instance-variable-value Object 'iv '(class) namespace)
+      (add-method Object 'initialize ()
+        self)
+      (add-method Object 'class ()
+        (get-object-class self))
+      (add-method Object 'isClass ()
+        false)
+      (add-method Object 'isMetaclass ()
+        false)
+      Object))) ; TODO: add 'doesNotUnderstand: method
+
+(define (build-Class namespace)
+  (let ([Class (send (get-class namespace 'Class) 'new '() namespace)])
+    (begin
+      (set-instance-variable-value Class 'name 'Class namespace)
+      (set-instance-variable-value Class 'superclass 'Object namespace)
+      (set-instance-variable-value Class 'iv '(class name superclass iv methodDict) namespace)
+      (set-instance-variable-value Class 'methodDict (make-methods-dictionary) namespace)
+      (build-Class-new Class namespace)
+      (build-Class-allocate Class namespace)
+      (add-method Class 'initialize ()
+        (begin
+          (super-send self 'initialize '() namespace)
+          (set-class-instance-variables
+               self
+               (compute-extended-instance-variables
+                 (get-class namespace (get-class-superclass-name self))
+                 (get-class-instance-variables self)))
+          (set-class-methods-dictionary self (make-methods-dictionary))
+          self))
+      (add-method Class 'newNamed:superclassName:instanceVariables: (className superclassName instanceVariableNames)
+        (let
+          ([newClass (send self 'allocate '() namespace)])
+          (set-instance-variable-value newClass 'name className namespace)
+          (set-instance-variable-value newClass 'superclass superclassName namespace)
+          (set-instance-variable-value newClass 'iv instanceVariableNames namespace)
+          (send newClass 'initialize '() namespace)))
+      (register-class namespace Class) ; Register Class class in namespace.
+      Class)))
 
 (define (build-kernel)
   (let
-      ([namespace (make-namespace)])
-    (build-Class namespace)
-    ; (build-Class-initialize (get-class namespace 'Class)) ; TODO!
-    (build-Class-new (get-class namespace 'Class) namespace)
-    (build-Class-allocate (get-class namespace 'Class) namespace)
+    ([namespace (make-namespace)])
+    (manually-build-Class namespace) ; Here we create the egg out of nowhere...
+    (build-Object namespace) ; ...so we can get the chicken...
+    (build-Class namespace) ; ...that can produce a true egg to replace the hand-made one. :-)
     namespace))
 
 ;-------------------------------------------------------------------------------
 
 ;-- Playground -----------------------------------------------------------------
-; (define namespace (build-kernel))
-; (define Class (get-class namespace 'Class))
-; 
-; (register-method Class 'yourself (lambda () (self)))
-; 
-; (lookup 'yourself Class namespace)
+(define namespace (build-kernel))
+(define Class (get-class namespace 'Class))
+(define Object (get-class namespace 'Object))
+
+(define Point (send Class 'newNamed:superclassName:instanceVariables: '(Point Object (x y)) namespace))
+(register-class namespace Point)
+
+(add-method Point 'x ()
+  (get-instance-variable-value self 'x namespace))
+
+(add-method Point 'y ()
+  (get-instance-variable-value self 'y namespace))
+
+(add-method Point 'y: (y)
+  (begin
+    (set-instance-variable-value self 'y y namespace)
+    self))
+
+(add-method Point 'x: (x)
+  (begin
+    (set-instance-variable-value self 'x x namespace)
+    self))
+
+(define point-instance (send Point 'new '() namespace))
+(send point-instance 'x: '(1) namespace)
+(send point-instance 'y: '(2) namespace)
+(send point-instance 'x '() namespace)
+(send point-instance 'y '() namespace)
 
 ;-------------------------------------------------------------------------------
 
